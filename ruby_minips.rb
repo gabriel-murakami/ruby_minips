@@ -16,6 +16,11 @@ class RubyMinips
 
   REGISTER_HASH = Hash.new(0)
 
+  # REGISTER_HASH = {
+  #   '$zero' => '00000000',
+  #   ...
+  # }
+
   REGISTER = [
     '$zero', '$at', '$v0', '$v1', '$a0', '$a1', '$a2', '$a3',
     '$t0', '$t1', '$t2', '$t3', '$t4', '$t5', '$t6', '$t7',
@@ -113,6 +118,8 @@ class RubyMinips
     end
   end
 
+  # Execution Methods
+
   def execute_r_format(instruction)
     rs = REGISTER[instruction.rs.to_i(2)]
     rt = REGISTER[instruction.rt.to_i(2)]
@@ -139,6 +146,7 @@ class RubyMinips
     execute_opcode(op: op, addr_or_val: addr_or_val)
   end
 
+  # solução retirada do Stack Overflow
   def two_complement_resp(bin)
     if bin.to_i(2) > 2**15
       bin.to_i(2) - 2**16
@@ -191,12 +199,6 @@ class RubyMinips
     end
   end
 
-  def aligned_address?(register)
-    return true if register.to_i(16) % 4 == 0
-
-    false
-  end
-
   def format_data(data)
     temp = ""
 
@@ -205,6 +207,12 @@ class RubyMinips
     end
 
     temp
+  end
+
+  def aligned_address?(register)
+    return true if register.to_i(16) % 4 == 0
+
+    false
   end
 
   def execute_funct(funct:, rs: '', rt: '', rd: '', shamt: '')
@@ -316,8 +324,6 @@ class RubyMinips
     end
   end
 
-  # Utility Methods
-
   def to_bin_string(hexa_string)
     "%032b" % hexa_string.to_i(16)
   end
@@ -355,14 +361,14 @@ class RubyMinips
 
   def create_r_instruction(instruction)
     INSTRUCTIONS << RFormat.new(
-        instruction[0..5],
-        instruction[6..10],
-        instruction[11..15],
-        instruction[16..20],
-        instruction[21..25],
-        instruction[26..31]
-      )
-    end
+      instruction[0..5],
+      instruction[6..10],
+      instruction[11..15],
+      instruction[16..20],
+      instruction[21..25],
+      instruction[26..31]
+    )
+  end
 
   def create_i_instruction(instruction)
     INSTRUCTIONS << IFormat.new(
@@ -383,24 +389,11 @@ class RubyMinips
   # Load Methods
 
   def load_files(file_name)
-    load_text(file_name + '.text')
-    load_data(file_name + '.data')
+    read_file(file_name + '.text', 'text')
+    read_file(file_name + '.data', 'data')
   end
 
-  def load_text(file_name)
-    instructions = File.binread(file_name)
-
-    unpacked_instructions = instructions.unpack('H*')[0]
-
-    # operação retirada do stack overflow
-    formatted_instructions = [unpacked_instructions].pack('H*').unpack('N*').pack('V*').unpack('H*')
-
-    sliced_instructions = slice_instructions(formatted_instructions)
-
-    load_in_memory(sliced_instructions, 'text')
-  end
-
-  def load_data(file_name)
+  def read_file(file_name, type)
     file = File.open(file_name)
 
     data = []
@@ -424,23 +417,7 @@ class RubyMinips
 
     data.map!(&:reverse)
 
-    load_in_memory(data, 'data')
-  end
-
-  def slice_instructions(instructions)
-    sliced_instructions = []
-
-    # slice in 4bytes words
-    (0...instructions[0].size).step(8).each do |i|
-      sliced_instructions << instructions[0][i..i+7]
-    end
-
-    # remove null elements
-    sliced_instructions.reject!.each_with_index do |e, i|
-      sliced_instructions[i] == '00000000' && sliced_instructions[i+1] == '00000000'
-    end
-
-    sliced_instructions
+    load_in_memory(data, type)
   end
 
   def load_in_memory(words, type)
