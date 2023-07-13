@@ -1,25 +1,32 @@
 require_relative 'print'
+require 'rubygems'
+require 'float-formats'
+include Flt
 
 class RubyMinips
   class InvalidOperationError < StandardError; end
   class InvalidSyscallError < StandardError; end
 
-  attr_reader :operation, :start_time, :file_name
+  attr_reader :operation, :start_time, :file_name, :r_format_count, :j_format_count, :i_format_count, :fr_format_count, :fi_format_count
+  attr_reader :monocycle_time, :pipelined_time, :monocycle_cycles, :pipelined_cycles, :condition_bit, :cache_type, :cache_hit, :cache_miss
 
-  MEMORY = Hash.new(0)
+  MEMORY = Hash.new(nil)
 
   INSTRUCTIONS = []
 
-  RFormat = Struct.new(:op, :rs, :rt, :rd, :shamt, :funct)
-  IFormat = Struct.new(:op, :rs, :rt, :addr_or_val)
-  JFormat = Struct.new(:op, :target_adress)
+  CACHE = []
+  Line = Struct.new(:id, :elements)
+  Element = Struct.new(:tag, :data)
+
+  RFormat = Struct.new(:addr, :hex, :op, :rs, :rt, :rd, :shamt, :funct, :nop?)
+  FRFormat = Struct.new(:addr, :hex, :op, :fmt, :ft, :fs, :fd, :funct)
+  IFormat = Struct.new(:addr, :hex, :op, :rs, :rt, :addr_or_val)
+  FIFormat = Struct.new(:addr, :hex, :op, :fmt, :ft, :addr_or_val)
+  JFormat = Struct.new(:addr, :hex, :op, :target_adress)
 
   REGISTER_HASH = Hash.new(0)
 
-  # REGISTER_HASH = {
-  #   '$zero' => '00000000',
-  #   ...
-  # }
+  FLOAT_REGISTER_HASH = Hash.new(0)
 
   REGISTER = [
     '$zero', '$at', '$v0', '$v1', '$a0', '$a1', '$a2', '$a3',
@@ -28,10 +35,32 @@ class RubyMinips
     '$t8', '$t9', '$k0', '$k1', '$gp', '$sp', '$fp', '$ra', 'pc'
   ].freeze
 
-  def initialize(operation, file_name)
+  FLOAT_REGISTER = [
+    "$f0", "$f1", "$f2", "$f3", "$f4", "$f5", "$f6", "$f7",
+    "$f8", "$f9", "$f10", "$f11", "$f12", "$f13", "$f14", "$f15",
+    "$f16", "$f17", "$f18", "$f19", "$f20", "$f21", "$f22", "$f23",
+    "$f24", "$f25", "$f26", "$f27", "$f28", "$f29", "$f30", "$f31", 'hi', 'lo'
+  ].freeze
+
+  def initialize(operation, cache_type, file_name)
     @start_time = Time.now
+    @condition_bit = false
     @operation = operation
     @file_name = file_name
+    @cache_type = cache_type
+    @cache_hit_ram = 0
+    @cache_miss_ram = 0
+    @cache_hit_l1 = 0
+    @cache_miss_l1 = 0
+    @r_format_count = 0
+    @i_format_count = 0
+    @j_format_count = 0
+    @fr_format_count = 0
+    @fi_format_count = 0
+    @monocycle_time = 0.0
+    @pipelined_time = 0.0
+    @monocycle_cycles = 0
+    @pipelined_cycles = 0
   end
 
   def execute
@@ -42,6 +71,9 @@ class RubyMinips
       decode
     when 'run'
       run
+    when 'trace'
+      File.open('minips.trace', 'w') {|file| file.truncate(0) }
+      run
     else
       raise InvalidOperationError
     end
@@ -50,150 +82,570 @@ class RubyMinips
   private
 
   def decode
-    decode_text
+    decode_all_instructions
 
-    print = Print.new(REGISTER)
+    print = Print.new(REGISTER, FLOAT_REGISTER)
 
     INSTRUCTIONS.each do |instruction|
-      if instruction.is_a?(RFormat)
+      to_print = if instruction.is_a?(RFormat)
         print.r_format(instruction)
       elsif instruction.is_a?(IFormat)
         print.i_format(instruction)
+      elsif instruction.is_a?(FRFormat)
+        print.fr_format(instruction)
+      elsif instruction.is_a?(FIFormat)
+        print.fi_format(instruction)
       else
         print.j_format(instruction)
       end
+
+      puts "0x#{instruction.addr}:       0x#{instruction.hex}       #{to_print}"
     end
   end
 
   def run
-    prepare_base_register
-
-    decode_text
+    prepare_base_register(REGISTER, REGISTER_HASH)
+    prepare_base_register(FLOAT_REGISTER, FLOAT_REGISTER_HASH)
 
     loop do
-      actual_instruction = MEMORY[REGISTER_HASH['pc']]
+      actual_instruction = decode_single_instruction(read_memory(REGISTER_HASH['pc']))
 
-      REGISTER_HASH['pc'] = "%08x" % (REGISTER_HASH['pc'].to_i(16) + 0x04)
-
-      if actual_instruction.is_a?(RFormat)
-        execute_r_format(actual_instruction)
-      elsif actual_instruction.is_a?(IFormat)
-        execute_i_format(actual_instruction)
-      else
-        execute_j_format(actual_instruction)
+      if operation.eql?('trace')
+        append_trace(actual_instruction, REGISTER_HASH['pc'])
       end
+
+      REGISTER_HASH['pc'] = REGISTER_HASH['pc'] + 4
+
+      run_single_instruction(actual_instruction)
+    end
+  end
+
+  def append_trace(actual_instruction, addr)
+    type = actual_instruction.class.to_s.split('::')[1].gsub('Format', '')
+    line = addr / 32
+
+    File.write('minips.trace', "#{type} 0x#{"%08x" % addr} (line# 0x#{"%08x" % line})\n", mode: 'a')
+  end
+
+  def run_single_instruction(actual_instruction)
+    if actual_instruction.is_a?(RFormat)
+      @r_format_count += 1
+      execute_r_format(actual_instruction)
+    elsif actual_instruction.is_a?(IFormat)
+      @i_format_count += 1
+      execute_i_format(actual_instruction)
+    elsif actual_instruction.is_a?(FRFormat)
+      @fr_format_count += 1
+      execute_fr_format(actual_instruction)
+    elsif actual_instruction.is_a?(FIFormat)
+      @fi_format_count += 1
+      execute_fi_format(actual_instruction)
+    else
+      @j_format_count += 1
+      execute_j_format(actual_instruction)
     end
   end
 
   def count_instructions
-    r_format = 0
-    i_format = 0
-    j_format = 0
+    all_format_count = @r_format_count + @i_format_count + @j_format_count + @fr_format_count + @fi_format_count
 
-    INSTRUCTIONS.each do |inst|
-      if inst.is_a?(RFormat)
-        r_format += 1
-      elsif inst.is_a?(IFormat)
-        i_format += 1
-      else
-        j_format += 1
-      end
-    end
-
-    "Instruction Count: #{INSTRUCTIONS.size} (R: #{r_format}, I: #{i_format}, J: #{j_format})"
+    puts "Instruction Count: #{all_format_count} (R: #{@r_format_count}, I: #{@i_format_count}, J: #{@j_format_count}, FR: #{@fr_format_count}, FI: #{@fi_format_count})"
+    puts "IPS: #{all_format_count / (Time.now - start_time)}s"
   end
 
-  def prepare_base_register
-    REGISTER.each do |r|
+  def count_time
+    all_format_count = @r_format_count + @i_format_count + @j_format_count + @fr_format_count + @fi_format_count
+
+    mono_ipc = all_format_count.to_f / @monocycle_cycles
+    mono_time = @monocycle_cycles.to_f / (8.4672*(10**6))
+    mono_mips = all_format_count.to_f / (mono_time*(10**6))
+
+    pipe_ipc = all_format_count.to_f / (@monocycle_cycles + 4)
+    pipe_time = (@monocycle_cycles.to_f + 4.0) / (33.8688*(10**6))
+    pipe_mips = all_format_count.to_f / (pipe_time*(10**6))
+
+    puts "\nSimulated execution times for:\n" + ("-" * 30)
+    puts "Monocyle"
+    puts "  Cycles: #{@monocycle_cycles}"
+    puts "  Frequency: 8.4672 MHz"
+    puts "  Estimated execution time: #{"%0.05f" % mono_time}"
+    puts "  IPC: #{"%0.2f" % mono_ipc}"
+    puts "  MIPS: #{"%0.2f" % mono_mips}"
+    puts "Pipelined"
+    puts "  Cycles: #{@monocycle_cycles + 4}"
+    puts "  Frequency: 33.8688 MHz"
+    puts "  Estimated execution time: #{"%0.05f" % @pipelined_time}"
+    puts "  IPC: #{"%0.2f" % pipe_ipc} "
+    puts "  MIPS: #{"%0.2f" % pipe_mips}"
+  end
+
+  def cache_hits_and_misses
+    puts "\nMemory Information\n" + ("-" * 30)
+    printf("%-6s %-10s %-10s %-10s %-10s\n", 'Level', 'Hits', 'Misses', 'Total', 'Miss Rate')
+    printf("%-6s %-10s %-10s %-10s %-10s\n", '-'*6, '-'*10, '-'*10, '-'*10, '-'*10)
+
+    case @cache_type
+    when '1'
+      total = @cache_hit_ram + @cache_miss_ram
+      miss_rate = @cache_miss_ram / total
+
+      printf("%6s %10s %10s %10s %10s\n", 'RAM', @cache_hit_ram, @cache_miss_ram, total, "#{miss_rate} %")
+    when '2'
+      total_ram = @cache_hit_ram + @cache_miss_ram
+      miss_rate_ram = ((@cache_miss_ram / total_ram.to_f) * 100).round(2)
+      total_l1 = @cache_hit_l1 + @cache_miss_l1
+      miss_rate_l1 = ((@cache_miss_l1 / total_l1.to_f) * 100).round(2)
+
+      printf("%6s %10s %10s %10s %10s\n", 'L1', @cache_hit_l1, @cache_miss_l1, total_l1, "#{miss_rate_l1} %")
+      printf("%6s %10s %10s %10s %10s\n", 'RAM', @cache_hit_ram, @cache_miss_ram, total_ram, "#{miss_rate_ram} %")
+    when '3'
+    when '4'
+    when '5'
+    when '6'
+    end
+  end
+
+  def prepare_base_register(register, hash)
+    register.each do |r|
       case r
       when '$sp'
-        REGISTER_HASH[r] = '7fffeffc'
+        hash[r] = 0x7fffeffc
       when '$gp'
-        REGISTER_HASH[r] = '10008000'
+        hash[r] = 0x10008000
       when 'pc'
-        REGISTER_HASH[r] = '00400000'
+        hash[r] = 0x00400000
       else
-        REGISTER_HASH[r] = '00000000'
+        hash[r] = 0x00000000
       end
+    end
+  end
+
+  # cache methods
+
+  def on_cache?(addr)
+    case @cache_type
+    when '1'
+      false
+    when '2'
+      CACHE.each do |line|
+        line.elements.each do |e|
+          if e.tag.eql?(addr)
+            return true
+          end
+        end
+      end
+
+      false
+    when '3'
+    when '4'
+    when '5'
+    when '6'
+    end
+  end
+
+  def load_cache_l1(addr)
+    line_id = addr/32
+    all_line_elements = MEMORY.map { |k, v| [k,v] if (k/32) == (addr/32) }
+
+    all_line_elements = all_line_elements.reject { |e| e.nil? }
+
+    all_line_elements.map! do |le|
+      Element.new(le[0], le[1])
+    end
+
+    @cache_miss_l1 += 1
+    @cache_hit_ram += 1
+    @monocycle_cycles += 100
+
+    CACHE << Line.new(line_id, all_line_elements)
+
+    MEMORY[addr]
+  end
+
+  def read_memory(addr)
+    case @cache_type
+    when '1'
+      @cache_hit_ram += 1
+      @monocycle_cycles += 101
+      MEMORY[addr]
+    when '2'
+      line_id = (addr / 32)
+      data_resp = nil
+
+      CACHE.each do |line|
+        if line.id.eql?(line_id)
+          line.elements.each do |e|
+            if addr.eql?(e.tag)
+              @cache_hit_l1 += 1
+              @monocycle_cycles += 1
+              data_resp = e.data
+              return data_resp
+            end
+          end
+        end
+      end
+
+      if data_resp.nil?
+        data_resp = load_cache_l1(addr)
+      end
+
+      data_resp
+    when '3'
+    when '4'
+    when '5'
+    when '6'
+    end
+  end
+
+  def write_memory(addr, data)
+    if operation.eql?('trace')
+      File.write('minips.trace', "W 0x#{"%08x" % addr} (line# 0x#{"%08x" % (addr/32)})\n", mode: 'a')
+    end
+
+    case @cache_type
+    when '1'
+      @cache_hit_ram += 1
+      @monocycle_cycles += 101
+      MEMORY[addr] = data
+    when '2'
+      if on_cache?(addr)
+        @cache_hit_l1 += 1
+        MEMORY[addr] = read_memory(addr)
+      else
+        @cache_miss_l1 += 1
+        MEMORY[addr] = data
+      end
+    when '3'
+    when '4'
+    when '5'
+    when '6'
     end
   end
 
   # Execution Methods
 
   def execute_r_format(instruction)
-    rs = REGISTER[instruction.rs.to_i(2)]
-    rt = REGISTER[instruction.rt.to_i(2)]
-    rd = REGISTER[instruction.rd.to_i(2)]
+    rs = REGISTER[instruction.rs]
+    rt = REGISTER[instruction.rt]
+    rd = REGISTER[instruction.rd]
     shamt = instruction.shamt
     funct = instruction.funct
 
-    execute_funct(funct: funct, rs: rs, rt: rt, rd: rd, shamt: shamt)
+    execute_funct(instruction, funct: funct, rs: rs, rt: rt, rd: rd, shamt: shamt)
   end
 
   def execute_i_format(instruction)
-    rs = REGISTER[instruction.rs.to_i(2)]
-    rt = REGISTER[instruction.rt.to_i(2)]
+    rs = REGISTER[instruction.rs]
+    rt = REGISTER[instruction.rt]
     addr_or_val = instruction.addr_or_val
     op = instruction.op
 
-    execute_opcode(op: op, rs: rs, rt: rt, addr_or_val: addr_or_val)
+    execute_opcode(instruction, op: op, rs: rs, rt: rt, addr_or_val: addr_or_val)
   end
 
   def execute_j_format(instruction)
     addr_or_val = instruction.target_adress
     op = instruction.op
 
-    execute_opcode(op: op, addr_or_val: addr_or_val)
+    execute_opcode(instruction, op: op, addr_or_val: addr_or_val)
+  end
+
+  def execute_fr_format(instruction)
+    fmt = instruction.fmt
+    ft = FLOAT_REGISTER[instruction.ft]
+    fs = FLOAT_REGISTER[instruction.fs]
+    fd = FLOAT_REGISTER[instruction.fd]
+    funct = instruction.funct
+
+    execute_fr(instruction, funct: funct, fmt: fmt, ft: ft, fs: fs, fd: fd)
+  end
+
+  def execute_fi_format(instruction)
+    fmt = instruction.fmt
+    ft = FLOAT_REGISTER[instruction.ft]
+    addr_or_val = instruction.addr_or_val
+
+    execute_fi(instruction, fmt: fmt, ft: ft, addr_or_val: addr_or_val)
   end
 
   # solução retirada do Stack Overflow
   def two_complement_resp(bin)
-    if bin.to_i(2) > 2**15
-      bin.to_i(2) - 2**16
+    if bin > 2**15
+      bin - 2**16
     else
-      bin.to_i(2)
+      bin
     end
   end
 
-  def execute_opcode(op:, rs: '', rt: '', addr_or_val: '')
+  def two_complement_reg(bin)
+    if bin > 2**31
+      bin - 2**32
+    else
+      bin
+    end
+  end
+
+  def bin_to_float(sign, exp, frac, bias)
+    sum_frac = 0.0
+
+    frac = frac.to_s(2).split('').map(&:to_i)
+
+    (0...frac.length).each do |i|
+      sum_frac += (frac[i] * (2**(-(i+1))))
+    end
+
+    (((-1)**sign)*(1+sum_frac)*(2**(exp-bias)))
+  end
+
+  def bin32_to_float(bin)
+    sign = bin[31]
+    exponent = bin[23..30]
+    fraction = bin[0..22]
+
+    bin_to_float(sign, exponent, fraction, 127)
+  end
+
+  def bin64_to_float(bin)
+    sign = bin[63]
+    exponent = bin[52..62]
+    fraction = bin[0..51]
+
+    bin_to_float(sign, exponent, fraction, 1023)
+  end
+
+  def execute_fi(instruction, fmt: '', ft: '', addr_or_val: '')
+    case ft
+    when 0b00000
+      aux = REGISTER_HASH['pc']
+
+      if !@condition_bit
+        REGISTER_HASH['pc'] = REGISTER_HASH['pc'] + (two_complement_resp(addr_or_val) << 2)
+        run_single_instruction(decode_single_instruction(read_memory(aux)))
+      end
+    when 0b00001 # bc1t
+      aux = REGISTER_HASH['pc']
+
+      if @condition_bit
+        REGISTER_HASH['pc'] = REGISTER_HASH['pc'] + (two_complement_resp(addr_or_val) << 2)
+        run_single_instruction(decode_single_instruction(read_memory(aux)))
+      end
+    end
+  end
+
+  def execute_fr(instruction, funct: '', fmt: '', ft: '', fs: '', fd: '')
+    case fmt
+    when 0b00000 # mfc1
+      rt = REGISTER[instruction.ft]
+      REGISTER_HASH[rt] = FLOAT_REGISTER_HASH[fs]
+    when 0b10000
+      case funct
+      when 0b000000 # add.s
+        fs_value = ["%08x" % FLOAT_REGISTER_HASH[fs]].pack('H*').unpack('g').first
+        ft_value = ["%08x" % FLOAT_REGISTER_HASH[ft]].pack('H*').unpack('g').first
+
+        fd_value = fs_value + ft_value
+
+        FLOAT_REGISTER_HASH[fd] = [fd_value.to_f].pack('g').unpack('H*').first.to_i(16)
+      when 0b000001
+        fs_value = ["%08x" % FLOAT_REGISTER_HASH[fs]].pack('H*').unpack('g').first
+        ft_value = ["%08x" % FLOAT_REGISTER_HASH[ft]].pack('H*').unpack('g').first
+
+        fd_value = fs_value - ft_value
+
+        FLOAT_REGISTER_HASH[fd] = [fd_value.to_f].pack('g').unpack('H*').first.to_i(16)
+      when 0b000010 # mul.s
+        fs_value = ["%08x" % FLOAT_REGISTER_HASH[fs]].pack('H*').unpack('g').first
+        ft_value = ["%08x" % FLOAT_REGISTER_HASH[ft]].pack('H*').unpack('g').first
+
+        fd_value = fs_value * ft_value
+
+        FLOAT_REGISTER_HASH[fd] = [fd_value.to_f].pack('g').unpack('H*').first.to_i(16)
+      when 0b000110 # mov.s
+        FLOAT_REGISTER_HASH[fd] = FLOAT_REGISTER_HASH[fs]
+      when 0b111100 # c.lt.s
+        if FLOAT_REGISTER_HASH[fs] < FLOAT_REGISTER_HASH[ft]
+          @condition_bit = true
+        end
+      end
+    when 0b10001
+      case funct
+      when 0b000000 # add.d
+        fs_value_1 = "%08x" % FLOAT_REGISTER_HASH[fs]
+        fs_value_2 = "%08x" % FLOAT_REGISTER_HASH[FLOAT_REGISTER[instruction.fs + 1]]
+
+        ft_value_1 = "%08x" % FLOAT_REGISTER_HASH[ft]
+        ft_value_2 = "%08x" % FLOAT_REGISTER_HASH[FLOAT_REGISTER[instruction.ft + 1]]
+
+        fs_value = [(fs_value_2 + fs_value_1)].pack('H*').unpack('G').first
+        ft_value = [(ft_value_2 + ft_value_1)].pack('H*').unpack('G').first
+
+        fd_value = fs_value + ft_value
+
+        FLOAT_REGISTER_HASH[fd] = [fd_value.to_f].pack('G').unpack('H*').first.to_i(16)
+      when 0b000010 # mul.d
+        fs_value_1 = "%08x" % FLOAT_REGISTER_HASH[fs]
+        fs_value_2 = "%08x" % FLOAT_REGISTER_HASH[FLOAT_REGISTER[instruction.fs + 1]]
+
+        ft_value_1 = "%08x" % FLOAT_REGISTER_HASH[ft]
+        ft_value_2 = "%08x" % FLOAT_REGISTER_HASH[FLOAT_REGISTER[instruction.ft + 1]]
+
+        fs_value = [(fs_value_2 + fs_value_1)].pack('H*').unpack('G').first
+        ft_value = [(ft_value_2 + ft_value_1)].pack('H*').unpack('G').first
+
+        fd_value = fs_value * ft_value
+
+        FLOAT_REGISTER_HASH[fd] = [fd_value.to_f].pack('G').unpack('H*').first.to_i(16)
+      when 0b000011 # div.d
+        fs_value_1 = "%08x" % FLOAT_REGISTER_HASH[fs]
+        fs_value_2 = "%08x" % FLOAT_REGISTER_HASH[FLOAT_REGISTER[instruction.fs + 1]]
+
+        ft_value_1 = "%08x" % FLOAT_REGISTER_HASH[ft]
+        ft_value_2 = "%08x" % FLOAT_REGISTER_HASH[FLOAT_REGISTER[instruction.ft + 1]]
+
+        fs_value = [(fs_value_2 + fs_value_1)].pack('H*').unpack('G').first
+        ft_value = [(ft_value_2 + ft_value_1)].pack('H*').unpack('G').first
+
+        fd_value = fs_value / ft_value
+
+        FLOAT_REGISTER_HASH[fd] = [fd_value.to_f].pack('G').unpack('H*').first.to_i(16)
+      when 0b000110 # mov.d
+        fd1 = fd
+        fd2 = FLOAT_REGISTER[instruction.fd + 1]
+
+        fs1 = fs
+        fs2 = FLOAT_REGISTER[instruction.fs + 1]
+
+        FLOAT_REGISTER_HASH[fd1] = FLOAT_REGISTER_HASH[fs1]
+        FLOAT_REGISTER_HASH[fd2] = FLOAT_REGISTER_HASH[fs2]
+      when 0b100000 # cvt.s.d
+        fs_value_1 = "%08x" % FLOAT_REGISTER_HASH[fs]
+        fs_value_2 = "%08x" % FLOAT_REGISTER_HASH[FLOAT_REGISTER[instruction.fs + 1]]
+
+        fs_value = [(fs_value_2 + fs_value_1)].pack('H*').unpack('G').pack('g').unpack('H*').first.to_i(16)
+
+        FLOAT_REGISTER_HASH[fd] = fs_value
+      end
+    when 0b10100 # cvt.d.w
+      converted_fs = [FLOAT_REGISTER_HASH[fs]].pack('G').unpack('H*').first.to_i(16)
+
+      FLOAT_REGISTER_HASH[fd] = converted_fs[0..31]
+      FLOAT_REGISTER_HASH[FLOAT_REGISTER[instruction.fd + 1]] = converted_fs[32..63]
+    when 0b00100 # mtc1
+      rt = REGISTER[instruction.ft]
+      FLOAT_REGISTER_HASH[fs] = REGISTER_HASH[rt]
+    end
+  end
+
+  def execute_opcode(instruction, op:, rs: '', rt: '', addr_or_val: '')
     case op
-    when '000010' # jump
-      REGISTER_HASH['pc'] = "%08x" % (addr_or_val.to_i(2) << 2)
-    when '000011' # jal
-      REGISTER_HASH['$ra'] = REGISTER_HASH['pc']
+    when 0b000001 # bgez
+      aux = REGISTER_HASH['pc']
 
-      REGISTER_HASH['pc'] = "%08x" % (addr_or_val.to_i(2) << 2)
-    when '000100' # beq
+      if REGISTER_HASH[rs] >= 0
+        REGISTER_HASH['pc'] = REGISTER_HASH['pc'] + (two_complement_resp(addr_or_val) << 2)
+        run_single_instruction(decode_single_instruction(read_memory(aux)))
+      end
+    when 0b000010 # jump
+      aux = REGISTER_HASH['pc']
+
+      REGISTER_HASH['pc'] = addr_or_val << 2
+
+      run_single_instruction(decode_single_instruction(read_memory(aux)))
+    when 0b000011 # jal
+      aux = REGISTER_HASH['pc']
+
+      REGISTER_HASH['$ra'] = REGISTER_HASH['pc'] + 4
+
+      REGISTER_HASH['pc'] = addr_or_val << 2
+
+      run_single_instruction(decode_single_instruction(read_memory(aux)))
+    when 0b000100 # beq
+      aux = REGISTER_HASH['pc']
+
       if REGISTER_HASH[rs] == REGISTER_HASH[rt]
-        REGISTER_HASH['pc'] = "%08x" % (REGISTER_HASH['pc'].to_i(16) + (two_complement_resp(addr_or_val) << 2))
+        REGISTER_HASH['pc'] = REGISTER_HASH['pc'] + (two_complement_resp(addr_or_val) << 2)
+        run_single_instruction(decode_single_instruction(read_memory(aux)))
       end
-    when '000101' # bne
-      if REGISTER_HASH[rs] != REGISTER_HASH[rt]
-        REGISTER_HASH['pc'] = "%08x" % (REGISTER_HASH['pc'].to_i(16) + (two_complement_resp(addr_or_val) << 2))
-      end
-    when '001000' # addi
-      REGISTER_HASH[rt] = "%08x" % (REGISTER_HASH[rs].to_i(16) + two_complement_resp(addr_or_val))
-    when '001100' # andi
-      REGISTER_HASH[rt] = "%08x" % (REGISTER_HASH[rs].to_i(16) & two_complement_resp(addr_or_val))
-    when '001001' # addiu
-      REGISTER_HASH[rt] = "%08x" % (REGISTER_HASH[rs].to_i(16) + two_complement_resp(addr_or_val))
-    when '001101' # ori
-      REGISTER_HASH[rt] = "%08x" % (REGISTER_HASH[rs].to_i(16) | two_complement_resp(addr_or_val))
-    when '001111' # lui
-      REGISTER_HASH[rt] = "%08x" % (two_complement_resp(addr_or_val) << 16)
-    when '100011' # lw
-      temp_value = "%08x" % (REGISTER_HASH[rs].to_i(16) + two_complement_resp(addr_or_val))
+    when 0b000101 # bne
+      aux = REGISTER_HASH['pc']
 
-      if MEMORY[temp_value] == 0
-        temp_mem = "%08x" % 0
-        MEMORY[temp_value] = temp_mem.dup
+      if REGISTER_HASH[rs] != REGISTER_HASH[rt]
+        REGISTER_HASH['pc'] = REGISTER_HASH['pc'] + (two_complement_resp(addr_or_val) << 2)
+        run_single_instruction(decode_single_instruction(read_memory(aux)))
+      end
+    when 0b001000 # addi
+      REGISTER_HASH[rt] = REGISTER_HASH[rs] + two_complement_resp(addr_or_val)
+    when 0b001010
+      if REGISTER_HASH[rs] < addr_or_val
+        REGISTER_HASH[rt] = 1
+      else
+        REGISTER_HASH[rt] = 0
+      end
+    when 0b001100 # andi
+      REGISTER_HASH[rt] = REGISTER_HASH[rs] & two_complement_resp(addr_or_val)
+    when 0b001001 # addiu
+      REGISTER_HASH[rt] = REGISTER_HASH[rs] + two_complement_resp(addr_or_val)
+    when 0b001101 # ori
+      REGISTER_HASH[rt] = REGISTER_HASH[rs] | two_complement_resp(addr_or_val)
+    when 0b001111 # lui
+      REGISTER_HASH[rt] = two_complement_resp(addr_or_val) << 16
+    when 0b100000 # lb
+      temp_value = REGISTER_HASH[rs] + two_complement_resp(addr_or_val)
+
+      if MEMORY[temp_value].nil?
+        temp_mem = 0
+        MEMORY[temp_value] = temp_mem
+      else
+        temp_mem = read_memory(temp_value)
+      end
+
+      REGISTER_HASH[rt] = temp_mem
+    when 0b100011 # lw
+      temp_value = REGISTER_HASH[rs] + two_complement_resp(addr_or_val)
+
+      if MEMORY[temp_value].nil?
+        temp_mem = 0
+        MEMORY[temp_value] = temp_mem
+      else
+        temp_mem = read_memory(temp_value)
+      end
+
+      REGISTER_HASH[rt] = temp_mem
+    when 0b101011 #sw
+      write_memory((REGISTER_HASH[rs] + two_complement_resp(addr_or_val)), REGISTER_HASH[rt])
+    when 0b110001 #lwc1
+      temp_value = REGISTER_HASH[rs] + two_complement_resp(addr_or_val)
+
+      if MEMORY[temp_value].nil?
+        temp_mem = 0
+        MEMORY[temp_value] = temp_mem
       else
         temp_mem = MEMORY[temp_value]
       end
 
-      REGISTER_HASH[rt] = temp_mem
-    when '101011' #sw
-      MEMORY["%08x" % (REGISTER_HASH[rs].to_i(16) + two_complement_resp(addr_or_val))] = REGISTER_HASH[rt]
+      ft = FLOAT_REGISTER[instruction.rt]
+      FLOAT_REGISTER_HASH[ft] = temp_mem
+    when 0b110101 #ldc1
+      temp_value_1 = REGISTER_HASH[rs] + two_complement_resp(addr_or_val)
+      temp_value_2 = temp_value_1 + 4
+
+      if MEMORY[temp_value_1].nil?
+        temp_mem_1 = 0
+        temp_mem_2 = 0
+        MEMORY[temp_value_1] = temp_mem_1
+        MEMORY[temp_value_2] = temp_mem_2
+      else
+        temp_mem_1 = MEMORY[temp_value_1]
+        temp_mem_2 = MEMORY[temp_value_2]
+      end
+
+      ft1 = FLOAT_REGISTER[instruction.rt]
+      ft2 = FLOAT_REGISTER[instruction.rt + 1]
+
+      FLOAT_REGISTER_HASH[ft1] = temp_mem_1
+      FLOAT_REGISTER_HASH[ft2] = temp_mem_2
+    when 0b111001 # swc1
+      MEMORY[REGISTER_HASH[rs] + two_complement_resp(addr_or_val)] = FLOAT_REGISTER_HASH[rt]
     else
       ''
     end
@@ -201,6 +653,8 @@ class RubyMinips
 
   def format_data(data)
     temp = ""
+
+    data = "%08x" % data
 
     data.scan(/.{1,2}/).reverse_each do |str|
       temp << str
@@ -210,23 +664,46 @@ class RubyMinips
   end
 
   def aligned_address?(register)
-    return true if register.to_i(16) % 4 == 0
+    return true if register % 4 == 0
 
     false
   end
 
-  def execute_funct(funct:, rs: '', rt: '', rd: '', shamt: '')
+  def execute_funct(instruction, funct:, rs: '', rt: '', rd: '', shamt: '')
     case funct
-    when '000000' # sll
-      REGISTER_HASH[rd] = "%08x" % (REGISTER_HASH[rt].to_i(16) << shamt.to_i(2))
-    when '000010' # srl
-      REGISTER_HASH[rd] = "%08x" % (REGISTER_HASH[rt].to_i(16) >> shamt.to_i(2))
-    when '001000' # jr
+    when 0b000000 # sll
+      REGISTER_HASH[rd] = REGISTER_HASH[rt] << shamt
+    when 0b000010 # srl
+      REGISTER_HASH[rd] = REGISTER_HASH[rt] >> shamt
+    when 0b000011 # sra
+      sign = REGISTER_HASH[rt][31]
+      temp = REGISTER_HASH[rt] >> shamt
+
+      REGISTER_HASH[rd] = ((temp) + sign*(2**31))
+    when 0b001000 # jr
+      aux = REGISTER_HASH['pc']
+
       REGISTER_HASH['pc'] = REGISTER_HASH[rs]
-    when '001100' # syscall
-      case REGISTER_HASH['$v0'].to_i(16)
+
+      run_single_instruction(decode_single_instruction(read_memory(aux)))
+    when 0b001001 # jalr
+      aux = REGISTER_HASH['pc']
+
+      temp = REGISTER_HASH[rs]
+      REGISTER_HASH[rd] = REGISTER_HASH['pc'] + 4
+      REGISTER_HASH['pc'] = temp
+
+      run_single_instruction(decode_single_instruction(read_memory(aux)))
+    when 0b001100 # syscall
+      case REGISTER_HASH['$v0']
       when 1
-        print REGISTER_HASH['$a0'].to_i(16)
+        print REGISTER_HASH['$a0']
+      when 2
+        print IEEE_binary32(["%08x" % FLOAT_REGISTER_HASH['$f12']].pack('H*').unpack('g').first).to_text
+      when 3
+        aux = ("%08x" % FLOAT_REGISTER_HASH['$f13']) + ("%08x" % FLOAT_REGISTER_HASH['$f12'])
+
+        print IEEE_binary64([aux].pack('H*').unpack('G').first).to_text
       when 4
         resp = ""
         a0 = REGISTER_HASH['$a0']
@@ -234,7 +711,7 @@ class RubyMinips
 
         if !aligned_address?(a0)
           start_point = 0x10010000
-          temp_a0 = a0.to_i(16)
+          temp_a0 = a0
 
           loop do
             if start_point > temp_a0
@@ -248,7 +725,7 @@ class RubyMinips
           end
 
           if start_point != temp_a0
-            intermed = format_data(MEMORY["%08x" % start_point])
+            intermed = format_data(MEMORY[start_point])
 
             intermed_data = []
 
@@ -268,16 +745,16 @@ class RubyMinips
               resp += [d].pack('H*')
             end
 
-            a0 = ("%08x" % (start_point + 0x04))
+            a0 = start_point + 4
           end
         end
 
         loop do
-          break if MEMORY[a0].eql?(0)
+          break if MEMORY[a0].nil?
 
-          data << format_data(MEMORY[a0])
+          data << format_data(read_memory(a0))
 
-          a0 = "%08x" % (a0.to_i(16) + 0x4)
+          a0 = a0 + 4
         end
 
         data.join.scan(/.{1,2}/).each do |str|
@@ -288,113 +765,207 @@ class RubyMinips
 
         print resp
       when 5
-        int = STDIN.gets.chomp.to_i
-        REGISTER_HASH['$v0'] = "%08x" % int
+        REGISTER_HASH['$v0'] = STDIN.gets.chomp.to_i
+      when 6
+        float = STDIN.gets.chomp.to_f
+
+        FLOAT_REGISTER_HASH['$f0'] = [float].pack('g').unpack('H*').first.to_i(16)
+      when 7
+        float = STDIN.gets.chomp.to_f
+
+        aux = [float].pack('G').unpack('H*').first.to_i(16)
+
+        FLOAT_REGISTER_HASH['$f0'] = aux[0..31]
+        FLOAT_REGISTER_HASH['$f1'] = aux[32..64]
       when 10
-        REGISTER_HASH['pc'] = "%08x" % (REGISTER_HASH['pc'].to_i(16) + 0x4)
+        REGISTER_HASH['pc'] = REGISTER_HASH['pc'] + 4
         puts "\nExecution finished successfully"
         puts '-' * 30
-        puts count_instructions
-        puts "IPS: #{INSTRUCTIONS.size / (Time.now - start_time)}s"
+        count_instructions
+        count_time
+        cache_hits_and_misses
         exit!
       when 11
-        print "%c" % REGISTER_HASH['$a0'].to_i(16)
+        print "%c" % REGISTER_HASH['$a0']
       else
         raise InvalidSyscallError
       end
-    when '100000' # add
-      REGISTER_HASH[rd] = "%08x" % (REGISTER_HASH[rs].to_i(16) + REGISTER_HASH[rt].to_i(16))
-    when '100001' # addu
-      REGISTER_HASH[rd] = "%08x" % (REGISTER_HASH[rs].to_i(16) + REGISTER_HASH[rt].to_i(16))
+    when 0b010000 # mfhi
+      REGISTER_HASH[rd] = FLOAT_REGISTER_HASH['hi']
+    when 0b010010 # mflo
+      REGISTER_HASH[rd] = FLOAT_REGISTER_HASH['lo']
+    when 0b011000 # mult
+      rs_value = two_complement_reg(REGISTER_HASH[rs])
+      rt_value = two_complement_reg(REGISTER_HASH[rt])
 
-      if rd.eql?('$zero')
-        REGISTER_HASH[rd] = "%08x" % 0
+      mult_value = (rs_value * rt_value)
+
+      FLOAT_REGISTER_HASH['hi'] = mult_value[16..31]
+      FLOAT_REGISTER_HASH['lo'] = mult_value[0..15]
+    when 0b011010 # div
+      rs_value = two_complement_reg(REGISTER_HASH[rs])
+      rt_value = two_complement_reg(REGISTER_HASH[rt])
+
+      q = rs_value / rt_value
+      r = rs_value % rt_value
+
+      FLOAT_REGISTER_HASH['hi'] = r
+      FLOAT_REGISTER_HASH['lo'] = q
+    when 0b100000 # add
+      if !rd.eql?('$zero')
+        REGISTER_HASH[rd] = two_complement_reg(REGISTER_HASH[rs]) + two_complement_reg(REGISTER_HASH[rt])
       end
-    when '101010'
-      rs_value = REGISTER_HASH[rs].to_i(16)
-      rt_value =  REGISTER_HASH[rt].to_i(16)
+    when 0b100001 # addu
+      if !rd.eql?('$zero')
+        REGISTER_HASH[rd] = two_complement_reg(REGISTER_HASH[rs]) + two_complement_reg(REGISTER_HASH[rt])
+      end
+    when 0b100011 # subu
+      if !rd.eql?('$zero')
+        REGISTER_HASH[rd] = two_complement_reg(REGISTER_HASH[rs]) - two_complement_reg(REGISTER_HASH[rt])
+      end
+    when 0b100011
+      if !rd.eql?('$zero')
+        REGISTER_HASH[rd] = REGISTER_HASH[rs] - REGISTER_HASH[rt]
+      end
+    when 0b100100 # and
+      REGISTER_HASH[rd] = two_complement_reg(REGISTER_HASH[rs]) & two_complement_reg(REGISTER_HASH[rt])
+    when 0b100101 # or
+      REGISTER_HASH[rd] = two_complement_reg(REGISTER_HASH[rs]) | two_complement_reg(REGISTER_HASH[rt])
+    when 0b100110 # xor
+      REGISTER_HASH[rd] = two_complement_reg(REGISTER_HASH[rs]) ^ two_complement_reg(REGISTER_HASH[rt])
+    when 0b101010 # slt
+      rs_value = two_complement_reg(REGISTER_HASH[rs])
+      rt_value = two_complement_reg(REGISTER_HASH[rt])
 
       if rs_value < rt_value
-        REGISTER_HASH[rd] = "%08x" % 1
+        REGISTER_HASH[rd] = 1
       else
-        REGISTER_HASH[rd] = "%08x" % 0
+        REGISTER_HASH[rd] = 0
+      end
+    when 0b101011 # sltu
+      rs_value = two_complement_reg(REGISTER_HASH[rs])
+      rt_value = two_complement_reg(REGISTER_HASH[rt])
+
+      if rs_value < rt_value
+        REGISTER_HASH[rd] = 1
+      else
+        REGISTER_HASH[rd] = 0
       end
     else
       ''
     end
   end
 
-  def to_bin_string(hexa_string)
-    "%032b" % hexa_string.to_i(16)
-  end
-
   # Decode Methods
 
-  def decode_text
+  def decode_all_instructions
     start_point = 0x00400000
 
-    while(MEMORY["%08x" % start_point] != 0) do
-      instruction = MEMORY["%08x" % start_point]
+    while(MEMORY[start_point] != nil) do
+      instruction = MEMORY[start_point]
 
-      instruction = to_bin_string(instruction)
+      INSTRUCTIONS << classify_instruction(instruction, addr: start_point)
 
-      classify_instruction(instruction)
-
-      MEMORY["%08x" % start_point] = INSTRUCTIONS[-1]
+      MEMORY[start_point] = INSTRUCTIONS[-1]
 
       start_point = start_point + 0x04
     end
   end
 
-  def classify_instruction(instruction)
-    opcode = instruction[0..5]
+  def decode_single_instruction(instruction)
+    classify_instruction(instruction)
+  end
+
+  def classify_instruction(instruction, addr: 0)
+    opcode = instruction[26..31]
+    fmt = instruction[21..25]
 
     case opcode
-    when '000000'
-     create_r_instruction(instruction)
-    when '000010', '000011'
-     create_j_instruction(instruction)
+    when 0b000000
+     create_r_instruction(instruction, addr: addr)
+    when 0b010001
+      if fmt.eql?(0b01000)
+        create_fi_instruction(instruction, addr: addr)
+      else
+        create_fr_instruction(instruction, addr: addr)
+      end
+    when 0b000010, 0b000011
+     create_j_instruction(instruction, addr: addr)
     else
-     create_i_instruction(instruction)
+     create_i_instruction(instruction, addr: addr)
     end
   end
 
-  def create_r_instruction(instruction)
-    INSTRUCTIONS << RFormat.new(
-      instruction[0..5],
-      instruction[6..10],
-      instruction[11..15],
-      instruction[16..20],
+  def create_fr_instruction(instruction, addr: 0)
+    FRFormat.new(
+      "%08x" % addr,
+      "%08x" % instruction,
+      instruction[26..31],
       instruction[21..25],
-      instruction[26..31]
-    )
-  end
-
-  def create_i_instruction(instruction)
-    INSTRUCTIONS << IFormat.new(
-      instruction[0..5],
-      instruction[6..10],
+      instruction[16..20],
       instruction[11..15],
-      instruction[16..31]
+      instruction[6..10],
+      instruction[0..5]
     )
   end
 
-  def create_j_instruction(instruction)
-    INSTRUCTIONS << JFormat.new(
+  def create_r_instruction(instruction, addr: 0)
+    RFormat.new(
+      "%08x" % addr,
+      "%08x" % instruction,
+      instruction[26..31],
+      instruction[21..25],
+      instruction[16..20],
+      instruction[11..15],
+      instruction[6..10],
       instruction[0..5],
-      instruction[6..31]
+      (instruction.zero? ? true : false)
+    )
+  end
+
+  def create_fi_instruction(instruction, addr: 0)
+    FIFormat.new(
+      "%08x" % addr,
+      "%08x" % instruction,
+      instruction[26..31],
+      instruction[21..25],
+      instruction[16..20],
+      instruction[0..15]
+    )
+  end
+
+  def create_i_instruction(instruction, addr: 0)
+    IFormat.new(
+      "%08x" % addr,
+      "%08x" % instruction,
+      instruction[26..31],
+      instruction[21..25],
+      instruction[16..20],
+      instruction[0..15]
+    )
+  end
+
+  def create_j_instruction(instruction, addr: 0)
+    JFormat.new(
+      "%08x" % addr,
+      "%08x" % instruction,
+      instruction[26..31],
+      instruction[0..25]
     )
   end
 
   # Load Methods
 
   def load_files(file_name)
-    read_file(file_name + '.text', 'text')
-    read_file(file_name + '.data', 'data')
+    read_file("#{file_name}.text", 'text')
+    read_file("#{file_name}.data", 'data')
+    read_file("#{file_name}.rodata", 'rodata')
   end
 
   def read_file(file_name, type)
-    file = File.open(file_name)
+    file = File.open(file_name) if File.file?(file_name)
+
+    return unless file
 
     data = []
     prev = nil
@@ -404,31 +975,42 @@ class RubyMinips
 
       break if aux.nil?
 
-      data << aux.unpack('h*').first
+      data << aux.unpack('L*').first
 
       if prev == nil
         prev = data[-1]
-      elsif data[-1] == '00000000' && data[-2] == '00000000'
+      elsif data[-1].zero? && data[-2].zero? && data[-3].zero? && data[-4].zero?
         break
       end
     end
 
     file.close
 
-    data.map!(&:reverse)
-
     load_in_memory(data, type)
   end
 
   def load_in_memory(words, type)
-    initial_position = type == 'text' ? 0x00400000 : 0x10010000
+    case type
+    when 'text'
+      initial_position = 0x00400000
+    when 'data'
+      initial_position = 0x10010000
+    else
+      initial_position = 0x00800000
+    end
 
     words.each do |word|
-      MEMORY["%08x" % initial_position] = word
+      MEMORY[initial_position] = word
 
       initial_position = initial_position + 0x04
     end
   end
 end
 
-RubyMinips.new(ARGV[0], ARGV[1]).execute
+CACHE_OPTIONS = (1..6).map(&:to_s)
+
+if CACHE_OPTIONS.include?(ARGV[1])
+  RubyMinips.new(ARGV[0], ARGV[1], ARGV[2]).execute
+else
+  RubyMinips.new(ARGV[0], '1', ARGV[1]).execute
+end
